@@ -116,6 +116,7 @@ router.get("/", async (req, res) => {
     if (category && category !== "all") {
       if (category === "__otros__") {
                const main = [
+          "hotel", "hospedajes", "grass_sintetico", "tour_ayacucho",
           "pizzas_karaoke", "pizzas", "karaoke", "cafe", "discotecas",
           "tabernas", "cevicherias", "bares", "heladerias",
           "recreo", "pasteleria", "hamburguesas", "antojitos",
@@ -331,6 +332,7 @@ router.post("/", requireAuth, requireAdmin, async (req, res) => {
   try {
     const {
       name, category, description, address, website, phone, delivery_phone,
+      facebook, instagram, tiktok,
       photo_url_1, photo_url_2, photo_url_3,
       promotion, how_to_get_there, map_url,
       opening_hours, opens_at, closes_at, open_days, rating,
@@ -344,6 +346,9 @@ router.post("/", requireAuth, requireAdmin, async (req, res) => {
     const payload = {
       name, category, description, address,
       website: website || null,
+      facebook: facebook || null,
+      instagram: instagram || null,
+      tiktok: tiktok || null,
       phone: phone || null,
       delivery_phone: delivery_phone || null,
       photo_url_1,
@@ -382,6 +387,7 @@ router.put("/:id", requireAuth, requireAdmin, async (req, res) => {
     const { id } = req.params;
     const {
       name, category, description, address, website, phone, delivery_phone,
+      facebook, instagram, tiktok,
       photo_url_1, photo_url_2, photo_url_3,
       promotion, how_to_get_there, map_url,
       opening_hours, opens_at, closes_at, open_days, rating,
@@ -394,6 +400,9 @@ router.put("/:id", requireAuth, requireAdmin, async (req, res) => {
     const payload = {
       name, category, description, address,
       website: website || null,
+      facebook: facebook || null,
+      instagram: instagram || null,
+      tiktok: tiktok || null,
       phone: phone || null,
       delivery_phone: delivery_phone || null,
       photo_url_1,

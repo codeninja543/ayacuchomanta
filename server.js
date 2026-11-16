@@ -11,6 +11,9 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 
 import placesRouter from "./routes/places.js";
 import authRouter from "./routes/auth.js";
+import businessRequestsRouter from "./routes/businessRequests.js";
+import { adsRouter, eventsRouter, busesRouter } from "./routes/content.js";
+import settingsRouter from "./routes/settings.js";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -25,6 +28,11 @@ app.use(express.json());
 // ── API ────────────────────────────────────────
 app.use("/api/places", placesRouter);
 app.use("/api/auth", authRouter);
+app.use("/api/business-requests", businessRequestsRouter);
+app.use("/api/ads", adsRouter);
+app.use("/api/events", eventsRouter);
+app.use("/api/buses", busesRouter);
+app.use("/api/settings", settingsRouter);
 
 // Health check
 app.get("/api/health", (_req, res) => {
@@ -34,9 +42,6 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
-// ── Diagnóstico — confirma si las variables de entorno están bien
-// cargadas, sin exponer las claves secretas. Visita /api/diagnostico
-// en el navegador (local o producción) para verlo.
 app.get("/api/diagnostico", (_req, res) => {
   res.json({
     SUPABASE_URL_MAIN: process.env.SUPABASE_URL_MAIN ? "✅ definida" : "❌ FALTA",
@@ -45,14 +50,6 @@ app.get("/api/diagnostico", (_req, res) => {
   });
 });
 
-// ── Servir el frontend ya compilado (producción) ───────────────────────
-// Soporta dos ubicaciones posibles de "dist" según cómo esté armado el
-// repo: backend/dist (si el build se copia ahí) o ../frontend/dist
-// (si el repo tiene carpetas frontend/ y backend/ separadas, como en
-// este proyecto). Usa la primera que exista; si ninguna existe (por
-// ejemplo en desarrollo local, donde el frontend corre con Vite en
-// otro puerto), simplemente no sirve estáticos y deja que las rutas
-// /api/* sigan funcionando igual.
 const candidateDistPaths = [
   path.join(__dirname, "dist"),
   path.join(__dirname, "..", "frontend", "dist"),
@@ -72,12 +69,11 @@ if (distPath) {
   console.warn("⚠️  No se encontró carpeta dist del frontend — modo solo-API (normal en desarrollo con Vite aparte).");
 }
 
-// 404 catch-all (solo llega aquí si no hay dist, o si es una ruta /api/* inexistente)
 app.use((_req, res) => {
   res.status(404).json({ error: "Ruta no encontrada" });
 });
 
-// ── Start ──────────────────────────────────────
+
 app.listen(PORT, () => {
   console.log(`🚀 Servidor en http://localhost:${PORT}`);
 });
