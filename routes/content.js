@@ -22,7 +22,7 @@ const missingColumn = (error, col) => {
   return m.includes(col) && /column|schema cache|does not exist/i.test(m);
 };
 
-function crudRouter({ table, label, fields, required, order, prepare, expires }) {
+function crudRouter({ table, label, fields, required, order, prepare, expires, extraCleanup }) {
   const router = Router();
   const missing = res => res.status(503).json({ error: "Supabase no está configurado (falta SUPABASE_SERVICE_ROLE_KEY_MAIN)" });
   const dbError = (res, error) => {
@@ -122,8 +122,13 @@ function crudRouter({ table, label, fields, required, order, prepare, expires })
     lastCleanup = now;
     const { data, error } = await supabaseMainAdmin.from(table).delete()
       .lt("expires_at", new Date(now).toISOString()).select("id");
-    if (error) { if (!missingColumn(error, "expires_at")) console.warn(`⚠️ limpieza ${table}:`, error.message); return; }
-    if (data?.length) console.log(`🧹 ${table}: ${data.length} vencido(s) eliminado(s)`);
+    if (error) { if (!missingColumn(error, "expires_at")) console.warn(`⚠️ limpieza ${table}:`, error.message); }
+    else if (data?.length) console.log(`🧹 ${table}: ${data.length} vencido(s) eliminado(s)`);
+    if (extraCleanup) {
+      const r = await extraCleanup(supabaseMainAdmin.from(table).delete()).select("id");
+      if (r.error) console.warn(`⚠️ limpieza ${table}:`, r.error.message);
+      else if (r.data?.length) console.log(`🧹 ${table}: ${r.data.length} pasado(s) eliminado(s)`);
+    }
   }
   if (expires) {
     // Revisa cada hora mientras el servidor está encendido
@@ -132,6 +137,11 @@ function crudRouter({ table, label, fields, required, order, prepare, expires })
   }
 
   return router;
+}
+
+/** Fecha AAAA-MM-DD en Perú (UTC-5), desplazada `offsetDays` días */
+function limaDate(offsetDays = 0) {
+  return new Date(Date.now() - 5 * 3600000 + offsetDays * 86400000).toISOString().slice(0, 10);
 }
 
 // "duration_days" (del panel): 0 = sin límite · N = se elimina solo en N días
@@ -167,6 +177,9 @@ export const eventsRouter = crudRouter({
   order: [["date", true], ["created_at", true]],
   expires: true,
   prepare: durationToExpires,
+  // Se borra solo 1 día después de su fecha (hora de Perú):
+  // un evento del 20 sigue el 21 y se borra al empezar el 22.
+  extraCleanup: q => q.lt("date", limaDate(-1)),
 });
 
 // ── Buses ──────────────────────────────────────────────────────────
