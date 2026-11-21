@@ -16,7 +16,13 @@ const T = {
 };
 
 // ── Fábrica de rutas CRUD ──────────────────────────────────────────
-function crudRouter({ table, label, fields, required, order }) {
+// Errores de "falta la columna X" (si aún no se ejecutó el SQL nuevo)
+const missingColumn = (error, col) => {
+  const m = String(error?.message || "");
+  return m.includes(col) && /column|schema cache|does not exist/i.test(m);
+};
+
+function crudRouter({ table, label, fields, required, order, prepare, expires }) {
   const router = Router();
   const missing = res => res.status(503).json({ error: "Supabase no está configurado (falta SUPABASE_SERVICE_ROLE_KEY_MAIN)" });
   const dbError = (res, error) => {
@@ -38,6 +44,7 @@ function crudRouter({ table, label, fields, required, order }) {
       out[key] = raw === null || raw === undefined || String(raw).trim() === "" ? null : f.parse(raw);
     }
     if (typeof body.active === "boolean") out.active = body.active;
+    if (prepare) Object.assign(out, prepare(body, isNew));
     for (const key of required) {
       if ((isNew && out[key] == null) || (key in out && out[key] == null)) throw `Falta: ${key === "image_url" ? "enlace de la foto" : key}`;
     }
@@ -47,7 +54,13 @@ function crudRouter({ table, label, fields, required, order }) {
   router.get("/", async (_req, res) => {
     res.set("Cache-Control", "no-store");
     if (!supabaseMainAdmin) return res.json([]);
-    const { data, error } = await sorted(supabaseMainAdmin.from(table).select("*").eq("active", true));
+    if (expires) cleanupExpired(); // borra los vencidos (como máximo cada 10 min)
+    let q = supabaseMainAdmin.from(table).select("*").eq("active", true);
+    if (expires) q = q.or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
+    let { data, error } = await sorted(q);
+    if (error && expires && missingColumn(error, "expires_at")) {
+      ({ data, error } = await sorted(supabaseMainAdmin.from(table).select("*").eq("active", true)));
+    }
     if (error) { console.warn(`⚠️ GET /api/${table}:`, error.message); return res.json([]); }
     res.json(data ?? []);
   });
@@ -55,6 +68,7 @@ function crudRouter({ table, label, fields, required, order }) {
   router.get("/all", requireAuth, requireAdmin, async (_req, res) => {
     res.set("Cache-Control", "no-store");
     if (!supabaseMainAdmin) return missing(res);
+    if (expires) await cleanupExpired(true);
     const { data, error } = await sorted(supabaseMainAdmin.from(table).select("*"));
     if (error) return dbError(res, error);
     res.json(data ?? []);
@@ -64,7 +78,12 @@ function crudRouter({ table, label, fields, required, order }) {
     if (!supabaseMainAdmin) return missing(res);
     let row;
     try { row = parseBody(req.body ?? {}, true); } catch (msg) { return res.status(400).json({ error: String(msg) }); }
-    const { data, error } = await supabaseMainAdmin.from(table).insert({ ...row, active: row.active ?? true }).select("*").single();
+    let { data, error } = await supabaseMainAdmin.from(table).insert({ ...row, active: row.active ?? true }).select("*").single();
+    if (error && expires && missingColumn(error, "expires_at")) {
+      // eslint-disable-next-line no-unused-vars
+      const { expires_at, ...rest } = row;
+      ({ data, error } = await supabaseMainAdmin.from(table).insert({ ...rest, active: rest.active ?? true }).select("*").single());
+    }
     if (error) return dbError(res, error);
     res.status(201).json(data);
   });
@@ -74,7 +93,13 @@ function crudRouter({ table, label, fields, required, order }) {
     let patch;
     try { patch = parseBody(req.body ?? {}, false); } catch (msg) { return res.status(400).json({ error: String(msg) }); }
     if (!Object.keys(patch).length) return res.status(400).json({ error: "No hay cambios" });
-    const { data, error } = await supabaseMainAdmin.from(table).update(patch).eq("id", req.params.id).select("*").maybeSingle();
+    let { data, error } = await supabaseMainAdmin.from(table).update(patch).eq("id", req.params.id).select("*").maybeSingle();
+    if (error && expires && missingColumn(error, "expires_at")) {
+      // eslint-disable-next-line no-unused-vars
+      const { expires_at, ...rest } = patch;
+      if (!Object.keys(rest).length) return res.status(400).json({ error: "Para usar la duración ejecuta database/anuncios-duracion.sql" });
+      ({ data, error } = await supabaseMainAdmin.from(table).update(rest).eq("id", req.params.id).select("*").maybeSingle());
+    }
     if (error) return dbError(res, error);
     if (!data) return res.status(404).json({ error: `${label} no encontrado` });
     res.json(data);
@@ -88,7 +113,33 @@ function crudRouter({ table, label, fields, required, order }) {
     res.json({ success: true });
   });
 
+  // ── Eliminación automática de los vencidos ──
+  let lastCleanup = 0;
+  async function cleanupExpired(force = false) {
+    if (!expires || !supabaseMainAdmin) return;
+    const now = Date.now();
+    if (!force && now - lastCleanup < 10 * 60 * 1000) return;
+    lastCleanup = now;
+    const { data, error } = await supabaseMainAdmin.from(table).delete()
+      .lt("expires_at", new Date(now).toISOString()).select("id");
+    if (error) { if (!missingColumn(error, "expires_at")) console.warn(`⚠️ limpieza ${table}:`, error.message); return; }
+    if (data?.length) console.log(`🧹 ${table}: ${data.length} vencido(s) eliminado(s)`);
+  }
+  if (expires) {
+    // Revisa cada hora mientras el servidor está encendido
+    setInterval(() => cleanupExpired(true), 60 * 60 * 1000).unref();
+    setTimeout(() => cleanupExpired(true), 15 * 1000).unref();
+  }
+
   return router;
+}
+
+// "duration_days" (del panel): 0 = sin límite · N = se elimina solo en N días
+function durationToExpires(body) {
+  if (!("duration_days" in body) || body.duration_days === null || body.duration_days === "") return {};
+  const days = Number(body.duration_days);
+  if (!Number.isInteger(days) || days < 0 || days > 365) throw "La duración debe ser de 0 a 365 días";
+  return { expires_at: days === 0 ? null : new Date(Date.now() + days * 86400000).toISOString() };
 }
 
 // ── Anuncios ───────────────────────────────────────────────────────
@@ -101,6 +152,8 @@ export const adsRouter = crudRouter({
   },
   required: ["placement", "title", "image_url"],
   order: [["placement", true], ["sort_order", true], ["created_at", false]],
+  expires: true,
+  prepare: durationToExpires,
 });
 
 // ── Eventos ────────────────────────────────────────────────────────
@@ -112,6 +165,8 @@ export const eventsRouter = crudRouter({
   },
   required: ["title", "date"],
   order: [["date", true], ["created_at", true]],
+  expires: true,
+  prepare: durationToExpires,
 });
 
 // ── Buses ──────────────────────────────────────────────────────────

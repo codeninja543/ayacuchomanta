@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { supabaseMainAdmin } from "../lib/supabase.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
-import { requireUuidParam, isSafeHttpUrl, isEmail } from "../middleware/security.js";
+import { requireUuidParam, isSafeHttpUrl, isEmail, UUID_RE } from "../middleware/security.js";
 
 const router = Router();
 
@@ -33,7 +33,10 @@ function rateLimit(req, res, next) {
   next();
 }
 
-
+// ──────────────────────────────────────────────
+// POST /api/business-requests   (requiere iniciar sesión)
+// Un dueño envía los datos de su negocio para publicarlo.
+// ──────────────────────────────────────────────
 const social = (v) => {
   const s = clean(v, 300);
   return isSafeHttpUrl(s) ? s : null;
@@ -54,6 +57,11 @@ router.post("/", requireAuth, rateLimit, async (req, res) => {
       phone: clean(b.phone, 30),
       email: isEmail(clean(b.email, 120)) ? clean(b.email, 120) : null,
       opening_hours: clean(b.opening_hours, 200) || null,
+      opens_at: /^([01]\d|2[0-3]):[0-5]\d$/.test(String(b.opens_at ?? "")) ? b.opens_at : null,
+      closes_at: /^([01]\d|2[0-3]):[0-5]\d$/.test(String(b.closes_at ?? "")) ? b.closes_at : null,
+      open_days: Array.isArray(b.open_days)
+        ? [...new Set(b.open_days.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6))]
+        : null,
       website: isSafeHttpUrl(clean(b.website, 200)) ? clean(b.website, 200) : null,
       facebook: social(b.facebook),
       instagram: social(b.instagram),
@@ -82,7 +90,13 @@ router.post("/", requireAuth, rateLimit, async (req, res) => {
       return res.status(503).json({ error: "Servicio no disponible por ahora" });
     }
 
-    const { error } = await supabaseMainAdmin.from("business_requests").insert(payload);
+    let { error } = await supabaseMainAdmin.from("business_requests").insert(payload);
+    // Si aún no se ejecutó database/solicitudes-horario.sql, guarda sin las columnas nuevas
+    if (error && /opens_at|closes_at|open_days|column/i.test(error.message || "")) {
+      // eslint-disable-next-line no-unused-vars
+      const { opens_at, closes_at, open_days, ...basic } = payload;
+      ({ error } = await supabaseMainAdmin.from("business_requests").insert(basic));
+    }
     if (error) {
       console.error("❌ POST /api/business-requests:", error);
       return res.status(500).json({ error: "No se pudo guardar la solicitud. Usa el botón de Soporte." });
@@ -94,7 +108,9 @@ router.post("/", requireAuth, rateLimit, async (req, res) => {
   }
 });
 
-
+// ──────────────────────────────────────────────
+// GET /api/business-requests   (solo admin)
+// ──────────────────────────────────────────────
 router.get("/", requireAuth, requireAdmin, async (_req, res) => {
   try {
     const { data, error } = await supabaseMainAdmin
@@ -109,17 +125,47 @@ router.get("/", requireAuth, requireAdmin, async (_req, res) => {
   }
 });
 
+// ──────────────────────────────────────────────
+// PATCH /api/business-requests/:id   (solo admin) — cambiar estado
+// ──────────────────────────────────────────────
 router.patch("/:id", requireUuidParam, requireAuth, requireAdmin, async (req, res) => {
   try {
     const status = clean(req.body?.status, 20);
     if (!["pendiente", "aprobado", "rechazado"].includes(status)) {
       return res.status(400).json({ error: "Estado no válido" });
     }
+    const patch = { status };
+    // Al aprobar se guarda el lugar que se publicó con esta solicitud
+    if (req.body?.place_id !== undefined) {
+      if (!UUID_RE.test(String(req.body.place_id))) return res.status(400).json({ error: "Lugar no válido" });
+      patch.place_id = req.body.place_id;
+    }
     const { error } = await supabaseMainAdmin
-      .from("business_requests").update({ status }).eq("id", req.params.id);
-    if (error) throw error;
+      .from("business_requests").update(patch).eq("id", req.params.id);
+    if (error) {
+      console.error("❌ PATCH /api/business-requests:", error.message);
+      return res.status(500).json({ error: "No se pudo actualizar. ¿Ejecutaste database/solicitudes-horario.sql?" });
+    }
     res.json({ ok: true });
   } catch (err) {
+    console.error("❌ PATCH /api/business-requests falló:", err instanceof Error ? err.message : err);
+    res.status(500).json({ error: "Error interno del servidor" });
+  }
+});
+
+// ──────────────────────────────────────────────
+// DELETE /api/business-requests/:id   (solo admin) — eliminar la solicitud
+// (No borra el lugar si ya se publicó; ese se elimina desde "Lugares".)
+// ──────────────────────────────────────────────
+router.delete("/:id", requireUuidParam, requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabaseMainAdmin
+      .from("business_requests").delete().eq("id", req.params.id).select("id");
+    if (error) throw error;
+    if (!data?.length) return res.status(404).json({ error: "Solicitud no encontrada" });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ DELETE /api/business-requests falló:", err instanceof Error ? err.message : err);
     res.status(500).json({ error: "Error interno del servidor" });
   }
 });
