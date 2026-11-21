@@ -23,19 +23,23 @@ function isPermissionDeniedError(error) {
  */
 export async function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization ?? "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
 
-  if (!token) {
+  // Un token de Supabase es un JWT (3 partes). Rechaza basura sin consultar a Supabase.
+  if (!token || token.length > 4096 || token.split(".").length !== 3) {
     return res.status(401).json({ error: "No autenticado" });
   }
 
-  const { data, error } = await supabaseMain.auth.getUser(token);
-  if (error || !data?.user) {
-    return res.status(401).json({ error: "Token inválido o expirado" });
+  try {
+    const { data, error } = await supabaseMain.auth.getUser(token);
+    if (error || !data?.user) {
+      return res.status(401).json({ error: "Sesión inválida o expirada" });
+    }
+    req.user = data.user;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Sesión inválida o expirada" });
   }
-
-  req.user = data.user;
-  next();
 }
 
 /**
@@ -61,7 +65,7 @@ export async function requireAdmin(req, res, next) {
       if (isMissingTableError(profileError)) {
         console.warn("⚠️ requireAdmin: tabla profiles no existe, continuando con otros chequeos");
       } else {
-        console.error("❌ requireAdmin: error consultando profiles:", profileError);
+        console.error("❌ requireAdmin: error consultando profiles:", profileError.message);
         return res.status(500).json({ error: "Error verificando permisos de administrador" });
       }
     } else {
@@ -101,19 +105,21 @@ export async function requireAdmin(req, res, next) {
 
     const roleValue = profileData?.role;
     const isAdminByProfile = typeof roleValue === "string" && /admin/i.test(roleValue);
-    const isAdminByMetadata = typeof req.user?.user_metadata?.role === "string"
-      ? /admin/i.test(req.user.user_metadata.role)
-      : false;
-    const isAdminByEmail = req.user.email && adminEmails.includes(req.user.email.toLowerCase());
+    // SEGURIDAD: user_metadata NO se usa, porque el propio usuario puede modificarlo.
+    // app_metadata solo lo puede cambiar el servidor, por eso sí es confiable.
+    const isAdminByAppMetadata = typeof req.user?.app_metadata?.role === "string" && /admin/i.test(req.user.app_metadata.role);
+    // Por correo: solo si el correo está verificado (Google lo verifica siempre)
+    const isAdminByEmail = !!req.user.email && !!req.user.email_confirmed_at
+      && adminEmails.includes(req.user.email.toLowerCase());
 
-    if (isAdminByProfile || roleRecord || isAdminByMetadata || isAdminByEmail) {
+    if (isAdminByProfile || roleRecord || isAdminByAppMetadata || isAdminByEmail) {
       next();
       return;
     }
 
     return res.status(403).json({ error: "Acceso restringido a administradores" });
   } catch (err) {
-    console.error("❌ requireAdmin falló inesperadamente:", err);
+    console.error("❌ requireAdmin falló inesperadamente:", err instanceof Error ? err.message : err);
     res.status(500).json({ error: "Error verificando permisos" });
   }
 }

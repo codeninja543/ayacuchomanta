@@ -1,13 +1,16 @@
 import { Router } from "express";
 import { supabaseMainAdmin } from "../lib/supabase.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
+import { counterLimiter, ratingLimiter, requireUuidParam, cleanText, optionalUrl } from "../middleware/security.js";
 
 const router = Router();
 
 function normalizePlaceMetrics(place) {
   if (!place) return place;
+  // eslint-disable-next-line no-unused-vars
+  const { created_by, ...publicPlace } = place; // no exponer quién lo creó
   return {
-    ...place,
+    ...publicPlace,
     views: Number(place.views ?? 0) || 0,
     reservations: Number(place.reservations ?? place.reservation_count ?? place.bookings ?? 0) || 0,
     direction_clicks: Number(place.direction_clicks ?? place.directions_clicks ?? 0) || 0,
@@ -68,6 +71,48 @@ async function incrementPlaceCounter(placeId, column) {
 }
 
 // ──────────────────────────────────────────────
+// Validación de los datos que llegan del panel (crear / editar lugar)
+// ──────────────────────────────────────────────
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+export function buildPlacePayload(body) {
+  const b = body || {};
+  const name = cleanText(b.name, 120);
+  const category = cleanText(b.category, 40);
+  const description = cleanText(b.description, 2000);
+  const address = cleanText(b.address, 200);
+  if (!name || !category || !description || !address || !b.photo_url_1) {
+    throw new Error("Campos obligatorios: nombre, categoría, descripción, dirección y foto principal");
+  }
+  if (!/^[a-z0-9_]+$/i.test(category)) throw new Error("Categoría no válida");
+
+  const time = (v) => { const t = cleanText(v, 5); return t && TIME_RE.test(t) ? t : null; };
+  const days = Array.isArray(b.open_days)
+    ? [...new Set(b.open_days.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6))]
+    : [0, 1, 2, 3, 4, 5, 6];
+
+  return {
+    name, category, description, address,
+    website: optionalUrl(b.website, "Sitio web", 500),
+    facebook: optionalUrl(b.facebook, "Facebook", 300),
+    instagram: optionalUrl(b.instagram, "Instagram", 300),
+    tiktok: optionalUrl(b.tiktok, "TikTok", 300),
+    phone: cleanText(b.phone, 30),
+    delivery_phone: cleanText(b.delivery_phone, 30),
+    photo_url_1: optionalUrl(b.photo_url_1, "Foto principal", 1000, { allowRelative: true }),
+    photo_url_2: optionalUrl(b.photo_url_2, "Foto 2", 1000, { allowRelative: true }),
+    photo_url_3: optionalUrl(b.photo_url_3, "Foto 3", 1000, { allowRelative: true }),
+    promotion: cleanText(b.promotion, 300),
+    how_to_get_there: cleanText(b.how_to_get_there, 1000),
+    map_url: optionalUrl(b.map_url, "Google Maps", 1000),
+    opening_hours: cleanText(b.opening_hours, 200),
+    opens_at: time(b.opens_at),
+    closes_at: time(b.closes_at),
+    open_days: days,
+    rating: Math.max(0, Math.min(5, parseFloat(b.rating) || 0)),
+  };
+}
+
+// ──────────────────────────────────────────────
 // Rotación diaria por turnos (round-robin)
 //
 // Cada 24 horas, un negocio distinto pasa a ser el primero de la lista.
@@ -105,8 +150,8 @@ function applyDailyRotation(items) {
 // ──────────────────────────────────────────────
 router.get("/", async (req, res) => {
   try {
-    const { category, limit = 50 } = req.query;
-    const safeLimit = Math.min(parseInt(limit) || 50, 100);
+    const category = typeof req.query.category === "string" ? req.query.category.slice(0, 40) : "";
+    const safeLimit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 100));
 
     let query = supabaseMainAdmin
       .from("places")
@@ -138,7 +183,7 @@ router.get("/", async (req, res) => {
     res.json(rotated.slice(0, safeLimit));
   } catch (err) {
     console.error("❌ GET /api/places falló:", err);
-    res.status(500).json({ error: err.message || "Error interno del servidor" });
+    res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
@@ -162,7 +207,7 @@ router.get("/featured", async (_req, res) => {
     res.json(rotated.slice(0, 8));
   } catch (err) {
     console.error("❌ GET /api/places/featured falló:", err);
-    res.status(500).json({ error: err.message || "Error interno del servidor" });
+    res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
@@ -170,7 +215,7 @@ router.get("/featured", async (_req, res) => {
 // POST /api/places/:id/reserve
 // Incrementa el contador de reservas del negocio
 // ──────────────────────────────────────────────
-router.post("/:id/reserve", async (req, res) => {
+router.post("/:id/reserve", counterLimiter, requireUuidParam, async (req, res) => {
   try {
     const { id } = req.params;
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -188,7 +233,7 @@ router.post("/:id/reserve", async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error("❌ POST /api/places/:id/reserve falló:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
@@ -196,7 +241,7 @@ router.post("/:id/reserve", async (req, res) => {
 // POST /api/places/:id/directions
 // Incrementa el contador de clics en "Cómo llegar"
 // ──────────────────────────────────────────────
-router.post("/:id/directions", async (req, res) => {
+router.post("/:id/directions", counterLimiter, requireUuidParam, async (req, res) => {
   try {
     const { id } = req.params;
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -214,7 +259,7 @@ router.post("/:id/directions", async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error("❌ POST /api/places/:id/directions falló:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
@@ -222,7 +267,7 @@ router.post("/:id/directions", async (req, res) => {
 // POST /api/places/:id/rate
 // Guarda una calificación de 1 a 5 y actualiza el promedio
 // ──────────────────────────────────────────────
-router.post("/:id/rate", async (req, res) => {
+router.post("/:id/rate", ratingLimiter, requireUuidParam, async (req, res) => {
   try {
     if (!supabaseMainAdmin) {
       console.error("❌ POST /:id/rate: supabaseMainAdmin es null — falta SUPABASE_SERVICE_ROLE_KEY_MAIN en las variables de entorno del backend.");
@@ -270,7 +315,7 @@ router.post("/:id/rate", async (req, res) => {
     res.json({ rating: average, rating_count: values.length });
   } catch (err) {
     console.error("❌ POST /api/places/:id/rate falló:", err);
-    res.status(500).json({ error: err.message || "Error interno del servidor" });
+    res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
@@ -321,7 +366,7 @@ router.get("/:id", async (req, res) => {
     });
   } catch (err) {
     console.error("❌ GET /api/places/:id falló:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
@@ -330,40 +375,9 @@ router.get("/:id", async (req, res) => {
 // ──────────────────────────────────────────────
 router.post("/", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const {
-      name, category, description, address, website, phone, delivery_phone,
-      facebook, instagram, tiktok,
-      photo_url_1, photo_url_2, photo_url_3,
-      promotion, how_to_get_there, map_url,
-      opening_hours, opens_at, closes_at, open_days, rating,
-    } = req.body;
-
-    if (!name || !category || !description || !address || !photo_url_1) {
-      return res.status(400).json({ error: "Campos obligatorios: name, category, description, address, photo_url_1" });
-    }
-
-    const isUuid = (value) => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
-    const payload = {
-      name, category, description, address,
-      website: website || null,
-      facebook: facebook || null,
-      instagram: instagram || null,
-      tiktok: tiktok || null,
-      phone: phone || null,
-      delivery_phone: delivery_phone || null,
-      photo_url_1,
-      photo_url_2: photo_url_2 || null,
-      photo_url_3: photo_url_3 || null,
-      promotion: promotion || null,
-      how_to_get_there: how_to_get_there || null,
-      map_url: map_url || null,
-      opening_hours: opening_hours || null,
-      opens_at: opens_at || null,
-      closes_at: closes_at || null,
-      open_days: Array.isArray(open_days) ? open_days : [0, 1, 2, 3, 4, 5, 6],
-      rating: Math.max(0, Math.min(5, parseFloat(rating) || 0)),
-      created_by: isUuid(req.user?.id) ? req.user.id : null,
-    };
+    let payload;
+    try { payload = buildPlacePayload(req.body); } catch (e) { return res.status(400).json({ error: e.message }); }
+    payload.created_by = req.user?.id ?? null;
 
     const { data, error } = await supabaseMainAdmin
       .from("places")
@@ -372,51 +386,21 @@ router.post("/", requireAuth, requireAdmin, async (req, res) => {
       .single();
 
     if (error) throw error;
-    res.status(201).json(data);
+    res.status(201).json(normalizePlaceMetrics(data));
   } catch (err) {
     console.error("❌ POST /api/places falló:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
 // ──────────────────────────────────────────────
 // PUT /api/places/:id  (solo admin)
 // ──────────────────────────────────────────────
-router.put("/:id", requireAuth, requireAdmin, async (req, res) => {
+router.put("/:id", requireUuidParam, requireAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const {
-      name, category, description, address, website, phone, delivery_phone,
-      facebook, instagram, tiktok,
-      photo_url_1, photo_url_2, photo_url_3,
-      promotion, how_to_get_there, map_url,
-      opening_hours, opens_at, closes_at, open_days, rating,
-    } = req.body;
-
-    if (!name || !category || !description || !address || !photo_url_1) {
-      return res.status(400).json({ error: "Campos obligatorios: name, category, description, address, photo_url_1" });
-    }
-
-    const payload = {
-      name, category, description, address,
-      website: website || null,
-      facebook: facebook || null,
-      instagram: instagram || null,
-      tiktok: tiktok || null,
-      phone: phone || null,
-      delivery_phone: delivery_phone || null,
-      photo_url_1,
-      photo_url_2: photo_url_2 || null,
-      photo_url_3: photo_url_3 || null,
-      promotion: promotion || null,
-      how_to_get_there: how_to_get_there || null,
-      map_url: map_url || null,
-      opening_hours: opening_hours || null,
-      opens_at: opens_at || null,
-      closes_at: closes_at || null,
-      open_days: open_days ?? [0, 1, 2, 3, 4, 5, 6],
-      rating: Math.max(0, Math.min(5, parseFloat(rating) || 0)),
-    };
+    let payload;
+    try { payload = buildPlacePayload(req.body); } catch (e) { return res.status(400).json({ error: e.message }); }
 
     const { data, error } = await supabaseMainAdmin
       .from("places")
@@ -426,17 +410,17 @@ router.put("/:id", requireAuth, requireAdmin, async (req, res) => {
       .single();
 
     if (error) throw error;
-    res.json(data);
+    res.json(normalizePlaceMetrics(data));
   } catch (err) {
     console.error("❌ PUT /api/places/:id falló:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
 // ──────────────────────────────────────────────
 // DELETE /api/places/:id  (solo admin)
 // ──────────────────────────────────────────────
-router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
+router.delete("/:id", requireUuidParam, requireAuth, requireAdmin, async (req, res) => {
   try {
     const { error } = await supabaseMainAdmin
       .from("places")
@@ -447,7 +431,7 @@ router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error("❌ DELETE /api/places/:id falló:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 

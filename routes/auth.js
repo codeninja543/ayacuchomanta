@@ -2,6 +2,11 @@ import "dotenv/config";
 import { Router } from "express";
 import { supabaseMain, supabaseMainAdmin } from "../lib/supabase.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
+import {
+  loginLimiter, signupLimiter, passwordResetLimiter, sessionLimiter,
+  isAccountLocked, registerLoginFailure, clearLoginFailures,
+  isEmail, passwordProblem, cleanText,
+} from "../middleware/security.js";
 
 const router = Router();
 
@@ -72,36 +77,19 @@ async function checkIsAdmin(userId, user = null) {
     }
     if (byId.data) return true;
 
-    if (user?.email) {
-      const byEmail = await client
-        .from("user_roles")
-        .select("role")
-        .eq("user_id", user.email)
-        .ilike("role", "%admin%")
-        .maybeSingle();
-
-      if (byEmail.error) {
-        console.warn("⚠️  checkIsAdmin error by email fallback:", byEmail.error.message);
-      }
-      if (byEmail.data) return true;
-    }
-
-    const roleMetadata = user?.user_metadata?.role ?? user?.app_metadata?.role;
-    if (hasAdminRole(roleMetadata)) {
-      return true;
-    }
-
-    const rolesArray = user?.user_metadata?.roles ?? user?.app_metadata?.roles;
-    if (Array.isArray(rolesArray) && rolesArray.some((role) => hasAdminRole(role))) {
-      return true;
-    }
+    // SEGURIDAD: solo app_metadata (lo cambia el servidor). user_metadata lo puede editar el usuario.
+    const appRole = user?.app_metadata?.role;
+    if (hasAdminRole(appRole)) return true;
+    const appRoles = user?.app_metadata?.roles;
+    if (Array.isArray(appRoles) && appRoles.some((role) => hasAdminRole(role))) return true;
 
     const adminEmails = (process.env.ADMIN_EMAILS || "")
       .split(",")
       .map((email) => email.trim().toLowerCase())
       .filter(Boolean);
 
-    if (user?.email && adminEmails.includes(user.email.toLowerCase())) {
+    // Por correo: solo con el correo verificado
+    if (user?.email && user?.email_confirmed_at && adminEmails.includes(user.email.toLowerCase())) {
       return true;
     }
 
@@ -112,39 +100,67 @@ async function checkIsAdmin(userId, user = null) {
   }
 }
 
-router.post("/signup", async (req, res) => {
+router.post("/signup", signupLimiter, async (req, res) => {
   try {
-    const { email, password, full_name } = req.body;
-    if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+    const email = String(req.body?.email ?? "").trim().toLowerCase();
+    const password = req.body?.password;
+    const full_name = cleanText(req.body?.full_name, 120);
+    if (!isEmail(email)) return res.status(400).json({ error: "Escribe un correo válido" });
+    const pwProblem = passwordProblem(password);
+    if (pwProblem) return res.status(400).json({ error: pwProblem });
+
+    // Solo se guarda el nombre: nunca datos de rol que vengan del navegador
     const { data, error } = await supabaseMain.auth.signUp({ email, password, options: { data: { full_name } } });
-    if (error) throw error;
+    if (error) {
+      console.warn("⚠️ signup:", error.message);
+      // Mensaje genérico: no revela si el correo ya existe
+      return res.status(400).json({ error: "No se pudo crear la cuenta. Revisa los datos o inicia sesión." });
+    }
 
     if (data.user?.id) {
       const client = supabaseMainAdmin || supabaseMain;
       try {
-        await client.from("profiles").upsert({ id: data.user.id, role: "user" }, { onConflict: "id" });
+        await client.from("profiles").upsert({ id: data.user.id, role: "user" }, { onConflict: "id", ignoreDuplicates: true });
       } catch (upsertErr) {
-        console.warn("⚠️  No se pudo inicializar el perfil del usuario:", upsertErr);
+        console.warn("⚠️  No se pudo inicializar el perfil del usuario:", upsertErr instanceof Error ? upsertErr.message : upsertErr);
       }
     }
 
     res.status(201).json({ user: data.user, session: data.session });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("❌ signup:", err instanceof Error ? err.message : err);
+    res.status(500).json({ error: "No se pudo crear la cuenta" });
   }
 });
 
-router.post("/signin", async (req, res) => {
+router.post("/signin", loginLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+    const email = String(req.body?.email ?? "").trim().toLowerCase();
+    const password = req.body?.password;
+    if (!isEmail(email) || typeof password !== "string" || !password || password.length > 200) {
+      return res.status(400).json({ error: "Escribe tu correo y contraseña" });
+    }
+
+    // Bloqueo temporal de la cuenta tras 5 intentos fallidos
+    const lockedMin = isAccountLocked(email);
+    if (lockedMin) {
+      return res.status(429).json({ error: `Demasiados intentos fallidos. Inténtalo en ${lockedMin} min.` });
+    }
+
     const { data, error } = await supabaseMain.auth.signInWithPassword({ email, password });
-    if (error) throw error;
-    const profileRole = data.user ? await getProfileRole(data.user.id) : null;
-    const isAdmin = data.user ? await checkIsAdmin(data.user.id, data.user) : false;
+    if (error || !data?.user) {
+      registerLoginFailure(email);
+      // Mensaje genérico: no revela si el correo existe
+      return res.status(401).json({ error: "Correo o contraseña incorrectos" });
+    }
+    clearLoginFailures(email);
+
+    const profileRole = await getProfileRole(data.user.id);
+    const isAdmin = await checkIsAdmin(data.user.id, data.user);
     res.json({ user: data.user, session: data.session, isAdmin, role: profileRole });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("❌ signin:", err instanceof Error ? err.message : err);
+    res.status(500).json({ error: "No se pudo iniciar sesión" });
   }
 });
 
@@ -152,83 +168,68 @@ router.post("/signout", async (req, res) => {
   res.json({ success: true });
 });
 
-router.post("/refresh", async (req, res) => {
+router.post("/refresh", sessionLimiter, async (req, res) => {
   try {
-    const { refresh_token } = req.body;
-    if (!refresh_token) return res.status(400).json({ error: "Refresh token required" });
+    const refresh_token = req.body?.refresh_token;
+    if (typeof refresh_token !== "string" || !refresh_token || refresh_token.length > 2048) {
+      return res.status(400).json({ error: "Sesión inválida" });
+    }
     const { data, error } = await supabaseMain.auth.refreshSession({ refresh_token });
-    if (error) throw error;
+    if (error || !data?.session) return res.status(401).json({ error: "Sesión expirada. Vuelve a iniciar sesión." });
     res.json({ user: data.user, session: data.session });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("❌ refresh:", err instanceof Error ? err.message : err);
+    res.status(401).json({ error: "Sesión expirada. Vuelve a iniciar sesión." });
   }
 });
 
-router.get("/me", async (req, res) => {
+router.get("/me", sessionLimiter, async (req, res) => {
   try {
-    const token = (req.headers.authorization || "").replace("Bearer ", "");
-    if (!token) return res.status(401).json({ error: "Unauthorized" });
+    const header = req.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+    if (!token || token.length > 4096 || token.split(".").length !== 3) return res.status(401).json({ error: "No autenticado" });
     const { data, error } = await supabaseMain.auth.getUser(token);
-    if (error || !data?.user) return res.status(401).json({ error: "Invalid token" });
+    if (error || !data?.user) return res.status(401).json({ error: "Sesión inválida o expirada" });
     const profileRole = await getProfileRole(data.user.id);
     const isAdmin = await checkIsAdmin(data.user.id, data.user);
     res.json({ user: data.user, isAdmin, role: profileRole });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("❌ me:", err instanceof Error ? err.message : err);
+    res.status(500).json({ error: "Error del servidor" });
   }
 });
 
-router.get("/debug", requireAuth, async (req, res) => {
-  try {
-    const client = supabaseMainAdmin || supabaseMain;
-    const [byId, byEmail] = await Promise.all([
-      client
-        .from("user_roles")
-        .select("role")
-        .eq("user_id", req.user.id)
-        .ilike("role", "%admin%")
-        .maybeSingle(),
-      req.user.email
-        ? client
-            .from("user_roles")
-            .select("role")
-            .eq("user_id", req.user.email)
-            .ilike("role", "%admin%")
-            .maybeSingle()
-        : Promise.resolve({ data: null, error: null }),
-    ]);
-
-    const isAdmin = await checkIsAdmin(req.user.id, req.user);
-    res.json({
-      user: req.user,
-      isAdmin,
-      user_roles_by_id: byId.data,
-      user_roles_by_email: byEmail.data,
-      env: {
-        SUPABASE_URL_MAIN: Boolean(process.env.SUPABASE_URL_MAIN),
-        SUPABASE_ANON_KEY_MAIN: Boolean(process.env.SUPABASE_ANON_KEY_MAIN),
-        SUPABASE_SERVICE_ROLE_KEY_MAIN: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY_MAIN),
-      },
-    });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-  }
+// Diagnóstico de permisos: solo administradores
+router.get("/debug", requireAuth, requireAdmin, async (req, res) => {
+  const isAdmin = await checkIsAdmin(req.user.id, req.user);
+  res.json({
+    email: req.user.email,
+    email_confirmed: Boolean(req.user.email_confirmed_at),
+    isAdmin,
+    env: {
+      SUPABASE_URL_MAIN: Boolean(process.env.SUPABASE_URL_MAIN),
+      SUPABASE_ANON_KEY_MAIN: Boolean(process.env.SUPABASE_ANON_KEY_MAIN),
+      SUPABASE_SERVICE_ROLE_KEY_MAIN: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY_MAIN),
+    },
+  });
 });
 
-router.post("/forgot-password", async (req, res) => {
+router.post("/forgot-password", passwordResetLimiter, async (req, res) => {
+  const email = String(req.body?.email ?? "").trim().toLowerCase();
+  if (!isEmail(email)) return res.status(400).json({ error: "Escribe un correo válido" });
   try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: "Email required" });
     await supabaseMain.auth.resetPasswordForEmail(email);
-    res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.warn("⚠️ forgot-password:", err instanceof Error ? err.message : err);
   }
+  // Siempre la misma respuesta: no revela si el correo está registrado
+  res.json({ success: true });
 });
 
-router.get("/google", async (_req, res) => {
+router.get("/google", sessionLimiter, async (_req, res) => {
   try {
-    const redirectTo = process.env.GOOGLE_CALLBACK_URL || process.env.FRONTEND_URL || "http://localhost:5173/";
+    const firstFrontend = (process.env.FRONTEND_URL || "").split(",")[0].trim();
+    const redirectTo = process.env.GOOGLE_CALLBACK_URL || (firstFrontend ? firstFrontend + "/" : "") || "http://localhost:5173/";
     const { data, error } = await supabaseMain.auth.signInWithOAuth({
       provider: "google",
       options: {
@@ -245,8 +246,8 @@ router.get("/google", async (_req, res) => {
 
     res.json({ url: data?.url ?? null });
   } catch (err) {
-    console.error("❌ Error iniciando OAuth con Google:", err);
-    res.status(500).json({ error: err instanceof Error ? err.message : "No se pudo iniciar con Google" });
+    console.error("❌ Error iniciando OAuth con Google:", err instanceof Error ? err.message : err);
+    res.status(500).json({ error: "No se pudo iniciar con Google" });
   }
 });
 
@@ -301,8 +302,8 @@ router.get("/users", requireAuth, requireAdmin, async (req, res) => {
 
     res.json({ users, total: users.length });
   } catch (err) {
-    console.error("❌ GET /api/auth/users falló:", err);
-    res.status(500).json({ error: err instanceof Error ? err.message : "No se pudo obtener la lista de usuarios" });
+    console.error("❌ GET /api/auth/users falló:", err instanceof Error ? err.message : err);
+    res.status(500).json({ error: "No se pudo obtener la lista de usuarios" });
   }
 });
 

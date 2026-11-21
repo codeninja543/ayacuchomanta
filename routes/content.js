@@ -1,31 +1,17 @@
-// ═══════════════════════════════════════════════════════════════════
-//  CONTENIDO EDITABLE DESDE EL PANEL DE ADMINISTRADOR
-//
-//    /api/ads     → anuncios (carrusel grande + destacados)
-//    /api/events  → eventos del banner del inicio
-//    /api/buses   → empresas de buses Lima ⇄ Ayacucho
-//
-//  Cada uno tiene las mismas rutas:
-//    GET    /            → público, solo los activos
-//    GET    /all         → admin, todos
-//    POST   /            → admin, crear
-//    PATCH  /:id         → admin, editar / ocultar / mostrar
-//    DELETE /:id         → admin, eliminar
-//
-//  Tablas: database/anuncios.sql y database/eventos-buses.sql
-// ═══════════════════════════════════════════════════════════════════
+
 import { Router } from "express";
 import { supabaseMainAdmin } from "../lib/supabase.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
+import { requireUuidParam, isSafeHttpUrl, isSafeRelativePath, cleanText } from "../middleware/security.js";
 
 // ── Validadores de campos ──────────────────────────────────────────
-const isHttp = v => /^https?:\/\/\S+$/i.test(v);
 const T = {
-  text:  (max = 200) => ({ parse: v => String(v).trim().slice(0, max) }),
-  image: () => ({ parse: v => { const s = String(v).trim(); if (!isHttp(s)) throw "El enlace de la foto debe empezar con https://"; return s.slice(0, 1000); } }),
-  link:  () => ({ parse: v => { const s = String(v).trim(); if (!isHttp(s) && !s.startsWith("/")) throw "El enlace debe empezar con https:// o /"; return s.slice(0, 500); } }),
+  text:  (max = 200) => ({ parse: v => { if (typeof v !== "string" && typeof v !== "number") throw "Dato inválido"; return cleanText(v, max); } }),
+  image: () => ({ parse: v => { const s = String(v).trim(); if (!isSafeHttpUrl(s)) throw "El enlace de la foto debe empezar con https://"; return s.slice(0, 1000); } }),
+  // Enlace: https://… o ruta interna "/buses" (nunca "//otro-sitio" ni "javascript:")
+  link:  () => ({ parse: v => { const s = String(v).trim(); if (!isSafeHttpUrl(s) && !isSafeRelativePath(s)) throw "El enlace debe empezar con https:// o /"; return s.slice(0, 500); } }),
   date:  () => ({ parse: v => { const s = String(v).trim(); if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw "Fecha inválida (AAAA-MM-DD)"; return s; } }),
-  int:   () => ({ parse: v => Math.trunc(Number(v) || 0) }),
+  int:   () => ({ parse: v => Math.max(-9999, Math.min(9999, Math.trunc(Number(v) || 0))) }),
   oneOf: (values) => ({ parse: v => { if (!values.includes(v)) throw `Valor no permitido: ${v}`; return v; } }),
 };
 
@@ -38,7 +24,8 @@ function crudRouter({ table, label, fields, required, order }) {
     if (msg.includes("does not exist") || msg.includes("Could not find the table")) {
       return res.status(500).json({ error: `Falta la tabla '${table}' en Supabase. Ejecuta el SQL de la carpeta database/.` });
     }
-    return res.status(500).json({ error: msg || "Error de base de datos" });
+    console.error(`❌ ${table}:`, msg);
+    return res.status(500).json({ error: "Error de base de datos" });
   };
   const sorted = q => order.reduce((acc, [col, asc]) => acc.order(col, { ascending: asc }), q);
 
@@ -82,7 +69,7 @@ function crudRouter({ table, label, fields, required, order }) {
     res.status(201).json(data);
   });
 
-  router.patch("/:id", requireAuth, requireAdmin, async (req, res) => {
+  router.patch("/:id", requireUuidParam, requireAuth, requireAdmin, async (req, res) => {
     if (!supabaseMainAdmin) return missing(res);
     let patch;
     try { patch = parseBody(req.body ?? {}, false); } catch (msg) { return res.status(400).json({ error: String(msg) }); }
@@ -93,7 +80,7 @@ function crudRouter({ table, label, fields, required, order }) {
     res.json(data);
   });
 
-  router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
+  router.delete("/:id", requireUuidParam, requireAuth, requireAdmin, async (req, res) => {
     if (!supabaseMainAdmin) return missing(res);
     const { data, error } = await supabaseMainAdmin.from(table).delete().eq("id", req.params.id).select("id");
     if (error) return dbError(res, error);

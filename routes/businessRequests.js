@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { supabaseMainAdmin } from "../lib/supabase.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
+import { requireUuidParam, isSafeHttpUrl, isEmail } from "../middleware/security.js";
 
 const router = Router();
 
@@ -16,8 +17,12 @@ const clean = (v, max = 500) =>
 
 // Rate limit simple en memoria: 5 solicitudes por hora por IP
 const hits = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, list] of hits) if (!list.some((t) => now - t < 3600_000)) hits.delete(ip);
+}, 10 * 60 * 1000).unref();
 function rateLimit(req, res, next) {
-  const ip = req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() || req.ip;
+  const ip = req.ip; // con "trust proxy" Express ya toma la IP real (el header crudo se puede falsificar)
   const now = Date.now();
   const recent = (hits.get(ip) || []).filter((t) => now - t < 3600_000);
   if (recent.length >= 5) {
@@ -28,13 +33,10 @@ function rateLimit(req, res, next) {
   next();
 }
 
-// ──────────────────────────────────────────────
-// POST /api/business-requests   (requiere iniciar sesión)
-// Un dueño envía los datos de su negocio para publicarlo.
-// ──────────────────────────────────────────────
+
 const social = (v) => {
   const s = clean(v, 300);
-  return /^https?:\/\/\S+$/i.test(s) ? s : null;
+  return isSafeHttpUrl(s) ? s : null;
 };
 
 router.post("/", requireAuth, rateLimit, async (req, res) => {
@@ -50,17 +52,17 @@ router.post("/", requireAuth, rateLimit, async (req, res) => {
       address: clean(b.address, 200),
       owner_name: clean(b.owner_name, 120),
       phone: clean(b.phone, 30),
-      email: clean(b.email, 120) || null,
+      email: isEmail(clean(b.email, 120)) ? clean(b.email, 120) : null,
       opening_hours: clean(b.opening_hours, 200) || null,
-      website: clean(b.website, 200) || null,
+      website: isSafeHttpUrl(clean(b.website, 200)) ? clean(b.website, 200) : null,
       facebook: social(b.facebook),
       instagram: social(b.instagram),
       tiktok: social(b.tiktok),
       user_id: req.user?.id ?? null,
       user_email: req.user?.email ?? null,
-      map_url: clean(b.map_url, 500) || null,
+      map_url: isSafeHttpUrl(clean(b.map_url, 500)) ? clean(b.map_url, 500) : null,
       photo_urls: Array.isArray(b.photo_urls)
-        ? b.photo_urls.map((u) => clean(u, 500)).filter((u) => /^https?:\/\//i.test(u)).slice(0, 3)
+        ? b.photo_urls.slice(0, 3).map((u) => clean(u, 500)).filter((u) => isSafeHttpUrl(u))
         : [],
       status: "pendiente",
     };
@@ -92,9 +94,7 @@ router.post("/", requireAuth, rateLimit, async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────
-// GET /api/business-requests   (solo admin)
-// ──────────────────────────────────────────────
+
 router.get("/", requireAuth, requireAdmin, async (_req, res) => {
   try {
     const { data, error } = await supabaseMainAdmin
@@ -105,14 +105,11 @@ router.get("/", requireAuth, requireAdmin, async (_req, res) => {
     if (error) throw error;
     res.json(data ?? []);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
-// ──────────────────────────────────────────────
-// PATCH /api/business-requests/:id   (solo admin) — cambiar estado
-// ──────────────────────────────────────────────
-router.patch("/:id", requireAuth, requireAdmin, async (req, res) => {
+router.patch("/:id", requireUuidParam, requireAuth, requireAdmin, async (req, res) => {
   try {
     const status = clean(req.body?.status, 20);
     if (!["pendiente", "aprobado", "rechazado"].includes(status)) {
@@ -123,7 +120,7 @@ router.patch("/:id", requireAuth, requireAdmin, async (req, res) => {
     if (error) throw error;
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
